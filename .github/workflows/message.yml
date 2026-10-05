@@ -1,0 +1,86 @@
+# message.yml — Messenger message handler
+#
+# Triggered by repository_dispatch from a messenger bridge worker.
+# Any messenger (Telegram, Discord, WhatsApp, Slack, Signal, ...) can use
+# this: the bridge translates the platform's webhook into the dispatch
+# protocol documented in docs/messengers.md and serves POST /send.
+# Logs the message, thinks via the vault, and replies through the bridge.
+
+name: message
+
+on:
+  repository_dispatch:
+    types: [message]
+
+permissions:
+  id-token: write
+  contents: write
+  issues: write
+
+jobs:
+  handle-message:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get OIDC token for vault
+        run: |
+          OIDC_TOKEN=$(curl -s \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=vault" \
+            | jq -r '.value')
+          echo "OIDC_TOKEN=${OIDC_TOKEN}" >> $GITHUB_ENV
+
+      - name: Log Telegram event
+        run: |
+          echo "Message from ${{ github.event.client_payload.username }} via ${{ github.event.client_payload.messenger }}"
+          echo "Chat ID: ${{ github.event.client_payload.chat_id }}"
+          git config user.name "zero"
+          git config user.email "zero@purplepincher.org"
+          echo "- Message from ${{ github.event.client_payload.username }} via ${{ github.event.client_payload.messenger }} at $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> MEMORY.md
+          git add MEMORY.md
+          git diff --staged --quiet || (git commit -m "message: from ${{ github.event.client_payload.username }} via ${{ github.event.client_payload.messenger }}" && git push)
+
+      - name: Think via vault
+        env:
+          TG_TEXT: ${{ github.event.client_payload.text }}
+          TG_USER: ${{ github.event.client_payload.username }}
+          VAULT_URL: ${{ vars.VAULT_URL }}
+        run: |
+          RESP=$(jq -n \
+            --arg oidc "$OIDC_TOKEN" \
+            --arg text "$TG_TEXT" \
+            --arg user "$TG_USER" \
+            '{
+              oidc_token: $oidc,
+              service: "llm",
+              action: "complete",
+              params: {
+                messages: [
+                  {role: "system", content: "You are a Purple Pincher, a git-agent living in this repo. You hear your human through a messaging app. Reply briefly and plainly, in your own voice. No fluff, no throat-clearing."},
+                  {role: "user", content: ("[" + $user + "]: " + $text)}
+                ],
+                max_tokens: 500
+              }
+            }' | curl -s -X POST ${VAULT_URL:-https://superinstance-vault.casey-digennaro.workers.dev}/proxy \
+              -H "Content-Type: application/json" -d @-)
+          echo "$RESP" | jq '{success, error}'
+          REPLY=$(echo "$RESP" | jq -r '.result.content // empty')
+          if [ -z "$REPLY" ]; then
+            REPLY="Hmm, my brain hiccuped. Try again in a minute."
+          fi
+          printf '%s' "$REPLY" | head -c 4000 > /tmp/pincher_reply.txt
+          echo "reply saved ($(wc -c < /tmp/pincher_reply.txt) bytes)"
+
+      - name: Reply via bridge
+        env:
+          TG_CHAT: ${{ github.event.client_payload.chat_id }}
+          BRIDGE_URL: ${{ vars.BRIDGE_URL }}
+        run: |
+          jq -n --argjson chat "$TG_CHAT" --arg text "$(cat /tmp/pincher_reply.txt)" \
+            '{chat_id: $chat, text: $text}' | \
+            curl -s -X POST ${BRIDGE_URL:-https://lobster-telegram-bridge.casey-digennaro.workers.dev}/send \
+              -H "Content-Type: application/json" -d @- | jq '{ok, error}'
