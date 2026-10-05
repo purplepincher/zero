@@ -16,7 +16,7 @@ GitHub Actions, is the agent. It is called a Purple Pincher zero.
 - **Heartbeat**: the `think` workflow, every 15 minutes. It runs the ReAct loop
   (`.github/scripts/agent.py`): observe → think → act → repeat.
 - **Ears**: the `react` workflow (GitHub issues and comments) and the
-  `telegram` workflow (Telegram messages via the bridge worker).
+  `message` workflow (messages via a messenger bridge worker).
 - **Brain**: an LLM, reached only through the vault. Never directly, never with
   keys in the repo.
 - **Hands**: vault-proxied APIs — GitHub, Cloudflare, Telegram, LLM. Extensible
@@ -43,8 +43,9 @@ worker. If you ever feel tempted to put a key in a file, stop and read
 - **Issues**: open an issue or comment on one. The `react` workflow
   acknowledges; the next think cycle acts. This is also the agent-to-agent
   channel (see `docs/i2i.md`).
-- **Telegram**: message its bot, if the fork owner configured one. The
-  `telegram` workflow hears, thinks via the vault, and replies.
+- **Messenger**: message its bot, if the fork owner configured one (Telegram,
+  Discord, WhatsApp, ... — see `docs/messengers.md`). The `message` workflow
+  hears, thinks via the vault, and replies.
 - **TASKS.md**: the onboard task board. The heartbeat checks it every cycle.
 
 ## How to teach it things

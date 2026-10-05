@@ -65,9 +65,10 @@ See `docs/clones.md` for the shell model.
 ## Layout
 
 ```
-.github/workflows/   think.yml, react.yml, telegram.yml
+.github/workflows/   think.yml, react.yml, message.yml
 .github/scripts/      agent.py (the brain), act.py (the hands)
-docs/                 plugins.md, i2i.md, memory.md, clones.md, tripartite.md
+docs/                 plugins.md, i2i.md, memory.md, clones.md, tripartite.md,
+                      messengers.md
 AGENTS.md             operator's manual
 ONBOARDING.md         first-boot checklist
 TASKS.md              the task board
