@@ -69,9 +69,3 @@ Telegram is a plugin with its own small worker (the bridge):
   doc for a stranger.
 - If a plugin needs configuration that is not secret (base URLs, default
   models), use plain worker variables, not secrets.
-
-## Constructions
-
-Zero is the minimal functional agent — the foundation everything else builds on. Plugins add capabilities; **constructions** compose them into ready-to-go flagship agents: zero + a messenger bridge + a memory discipline = a personal companion; zero + build plugins + a test harness = a repo builder.
-
-The composition runs both ways. Any construction decomposes back to the minimal agent plus its harness — strip the plugins, keep the shell. Nothing but the core is load-bearing. That reversibility is what makes the system universal for git: the smallest thing that works, everywhere git works, with everything else as removable parts.
