@@ -21,8 +21,12 @@ import os
 import subprocess
 import sys
 import time
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from harness import Harness, ToolContract, ContractError, norm, mentioned_paths
 
 # Configuration
 VAULT_URL = os.environ.get("VAULT_URL") or "https://superinstance-vault.casey-digennaro.workers.dev"
@@ -30,236 +34,258 @@ MAX_ITERATIONS = 10
 SCRATCH_DIR = Path("scratch")
 STATE_FILE = Path(".agent-state.json")
 
-# Permissions model
-# - "auto": execute immediately, no approval needed
-# - "vault": goes through vault (vault checks its own allowlist)
-# - "deferred": log the intent, don't execute (human reviews later)
-PERMISSIONS = {
-    # File operations
-    "read_file": "auto",
-    "write_scratch": "auto",      # scratch/ directory only
-    "write_file": "auto",          # repo files (except protected)
-    "write_workflow": "deferred",  # .github/workflows — human reviews
-    "delete_file": "deferred",
 
-    # Shell
-    "run_shell": "auto",           # sandboxed in Actions runner
-    "run_tests": "auto",
+# ---------------------------------------------------------------------------
+# Tool contracts (harness v2)
+#
+# Every tool is a contract: pre validates, run performs, post re-proves.
+# The harness records everything in an append-only ledger; the model's
+# completion claims are verified against the ledger, never trusted.
 
-    # Git
-    "git_commit": "auto",
-    "git_push_branch": "auto",
-    "git_push_main": "deferred",   # human reviews before main
-    "open_pr": "auto",
+def _register_contracts(h: Harness):
+    # -- read_file --
+    def read_pre(h, a):
+        p = norm(h.repo, a.get("path", ""))
+        src = h.repo / p
+        if not src.is_file():
+            raise ContractError(f"not a file: {p}")
+        if src.stat().st_size > 1_000_000:
+            raise ContractError(f"{p}: over read limit")
+        return {"path": p}
 
-    # APIs (all via vault)
-    "api_github": "vault",
-    "api_cloudflare": "vault",
-    "api_llm": "vault",
-    "api_telegram": "vault",
+    def read_run(h, a):
+        return {"content": (h.repo / a["path"]).read_text()[:10000]}
 
-    # Communication
-    "comment_issue": "auto",
-    "create_issue": "auto",
-}
+    h.register(ToolContract("read_file", read_pre, read_run))
 
+    # -- write_scratch --
+    def scratch_pre(h, a):
+        fn = a.get("filename", "")
+        if not isinstance(fn, str) or not fn or ".." in fn or "/" in fn:
+            raise ContractError(f"invalid filename: {fn!r}")
+        content = a.get("content", "")
+        if not isinstance(content, str):
+            raise ContractError("content must be a string")
+        return {"filename": fn, "content": content}
 
-def log(msg, level="INFO"):
-    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-    print(f"[{ts}] [{level}] {msg}", flush=True)
+    def scratch_run(h, a):
+        SCRATCH_DIR.mkdir(exist_ok=True)
+        (SCRATCH_DIR / a["filename"]).write_text(a["content"])
+        return {"path": f"scratch/{a['filename']}",
+                "bytes": len(a["content"])}
 
+    def scratch_post(h, a, r):
+        if not (SCRATCH_DIR / a["filename"]).is_file():
+            raise ContractError("postcondition: scratch file missing")
 
-def get_oidc_token():
-    """Get OIDC token from GitHub Actions environment."""
-    return os.environ.get("OIDC_TOKEN", "")
+    h.register(ToolContract("write_scratch", scratch_pre, scratch_run,
+                            scratch_post))
 
+    # -- write_file --
+    def write_pre(h, a):
+        p = norm(h.repo, a.get("path", ""))
+        if p.startswith(".github/workflows"):
+            raise ContractError(
+                "workflow writes are deferred for human review")
+        content = a.get("content")
+        if not isinstance(content, str):
+            raise ContractError("content must be a string")
+        if len(content.encode("utf-8")) > 200_000:
+            raise ContractError("content over 200k bytes")
+        return {"path": p, "content": content}
 
-def get_repo():
-    """Detect owner/repo from the git remote (works in forks too)."""
-    try:
-        url = subprocess.run(
-            ["git", "config", "--get", "remote.origin.url"],
-            capture_output=True, text=True, timeout=10
-        ).stdout.strip()
-        # Handles https://github.com/owner/repo(.git) and git@github.com:owner/repo(.git)
-        url = url.removesuffix(".git")
-        if "github.com" in url:
-            path = url.split("github.com", 1)[1].lstrip("/: ")
-            owner, repo = path.split("/", 1)
-            return owner, repo
-    except Exception:
-        pass
-    return "purplepincher", "zero"
+    def write_run(h, a):
+        dst = h.repo / a["path"]
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        data = a["content"].encode("utf-8")
+        tmp = dst.parent / f".tmp-{os.getpid()}-{time.time_ns()}"
+        tmp.write_bytes(data)
+        tmp.replace(dst)  # atomic: postcondition never sees a half file
+        return {"path": a["path"], "bytes": len(data),
+                "sha256": hashlib.sha256(data).hexdigest()}
 
+    def write_post(h, a, r):
+        dst = h.repo / a["path"]
+        if not dst.is_file():
+            raise ContractError(f"postcondition: {a['path']} missing")
+        if hashlib.sha256(dst.read_bytes()).hexdigest() != r["sha256"]:
+            raise ContractError(
+                f"postcondition: {a['path']} hash mismatch after write")
 
-def vault_call(service, action, params=None):
-    """Call an API through the vault."""
-    import urllib.request
+    h.register(ToolContract("write_file", write_pre, write_run, write_post))
 
-    payload = {
-        "oidc_token": get_oidc_token(),
-        "service": service,
-        "action": action,
-        "params": params or {},
-    }
+    # -- run_shell --
+    def shell_pre(h, a):
+        cmd = a.get("command", "")
+        if not isinstance(cmd, str) or not cmd.strip():
+            raise ContractError("empty command")
+        blocked = ["rm -rf /", "mkfs", ":(){:|:&};:", "curl | bash"]
+        if any(b in cmd for b in blocked):
+            raise ContractError("blocked dangerous command")
+        return {"command": cmd}
 
-    req = urllib.request.Request(
-        f"{VAULT_URL}/proxy",
-        data=json.dumps(payload).encode(),
-        headers={
-            "Content-Type": "application/json",
-            # Cloudflare edge 1010-blocks Python-urllib's default UA; identify as the agent
-            "User-Agent": "purplepincher-zero/1.0 (+https://github.com/purplepincher/zero)",
-        },
-        method="POST",
-    )
+    def shell_run(h, a):
+        r = subprocess.run(a["command"], shell=True, capture_output=True,
+                           text=True, timeout=120, cwd=h.repo)
+        return {"exit": r.returncode,
+                "output": (r.stdout + r.stderr)[:5000]}
 
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            return json.loads(resp.read().decode())
-    except Exception as e:
-        log(f"Vault call failed: {service}/{action}: {e}", "ERROR")
-        return {"error": str(e)}
+    h.register(ToolContract("run_shell", shell_pre, shell_run))
 
-
-def llm_think(messages, model=None):
-    """Call LLM via vault. Returns the response text."""
-    result = vault_call("llm", "complete", {
-        "messages": messages,
-        "model": model or "default",
-    })
-
-    if "error" in result:
-        log(f"LLM call failed: {result['error']}", "ERROR")
-        return None
-
-    # Extract text from vault response
-    r = result.get("result", result)
-    if isinstance(r, dict):
-        return r.get("content") or r.get("text") or json.dumps(r)
-    return str(r)
-
-
-def check_permission(tool_name):
-    """Check if a tool call is permitted and at what tier."""
-    return PERMISSIONS.get(tool_name, "deferred")
-
-
-def execute_tool(tool_call):
-    """
-    Execute a single tool call from the LLM.
-    Returns (success, result_text).
-    """
-    tool = tool_call.get("tool")
-    args = tool_call.get("args", {})
-
-    perm = check_permission(tool)
-    log(f"Tool: {tool} (permission: {perm})")
-
-    if perm == "deferred":
-        log(f"Deferred (needs human review): {tool} {args}", "WARN")
-        return True, f"[DEFERRED for human review: {tool} with {json.dumps(args)}]"
-
-    try:
-        if tool == "read_file":
-            path = args["path"]
-            if ".." in path:
-                return False, "Path traversal not allowed"
-            content = Path(path).read_text()
-            return True, content[:10000]  # Truncate large files
-
-        elif tool == "write_scratch":
-            SCRATCH_DIR.mkdir(exist_ok=True)
-            path = SCRATCH_DIR / args["filename"]
-            # Prevent directory traversal
-            if ".." in args["filename"] or "/" in args["filename"]:
-                return False, "Invalid filename"
-            path.write_text(args["content"])
-            return True, f"Wrote {len(args['content'])} bytes to scratch/{args['filename']}"
-
-        elif tool == "write_file":
-            path = args["path"]
-            if ".." in path or path.startswith(".github/workflows"):
-                return False, "Protected path"
-            Path(path).parent.mkdir(parents=True, exist_ok=True)
-            Path(path).write_text(args["content"])
-            return True, f"Wrote {len(args['content'])} bytes to {path}"
-
-        elif tool == "run_shell":
-            cmd = args["command"]
-            # Basic safety: block obviously dangerous commands
-            blocked = ["rm -rf /", "mkfs", ":(){:|:&};:", "curl | bash"]
-            if any(b in cmd for b in blocked):
-                return False, "Blocked dangerous command"
-            result = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True, timeout=120
-            )
-            output = result.stdout + result.stderr
-            return True, f"Exit {result.returncode}:\n{output[:5000]}"
-
-        elif tool == "run_tests":
-            # Convention: run pytest if tests exist, npm test if package.json
-            if Path("tests").exists():
-                result = subprocess.run(
-                    ["python3", "-m", "pytest", "tests/", "-x", "-q"],
-                    capture_output=True, text=True, timeout=300
-                )
-            elif Path("package.json").exists():
-                result = subprocess.run(
-                    ["npm", "test"], capture_output=True, text=True, timeout=300
-                )
-            else:
-                return True, "No test suite found"
-            output = result.stdout + result.stderr
-            return True, f"Exit {result.returncode}:\n{output[:5000]}"
-
-        elif tool == "api_github":
-            result = vault_call("github", args["action"], args.get("params", {}))
-            return True, json.dumps(result, indent=2)[:5000]
-
-        elif tool == "api_cloudflare":
-            result = vault_call("cloudflare", args["action"], args.get("params", {}))
-            return True, json.dumps(result, indent=2)[:5000]
-
-        elif tool == "comment_issue":
-            owner, repo = get_repo()
-            result = vault_call("github", "comment_issue", {
-                "owner": owner,
-                "repo": repo,
-                "issue_number": args["issue"],
-                "body": args["body"],
-            })
-            return True, "Comment posted"
-
-        elif tool == "create_issue":
-            owner, repo = get_repo()
-            result = vault_call("github", "create_issue", {
-                "owner": owner,
-                "repo": repo,
-                "title": args["title"],
-                "body": args.get("body", ""),
-            })
-            return True, f"Issue created: {json.dumps(result)[:200]}"
-
-        elif tool == "git_commit":
-            msg = args.get("message", "zero: autonomous commit")
-            subprocess.run(["git", "config", "user.name", "zero"], check=True)
-            subprocess.run(["git", "config", "user.email", "zero@purplepincher.org"], check=True)
-            subprocess.run(["git", "add", "-A"], check=True)
-            # Don't commit workflow changes autonomously
-            subprocess.run(["git", "reset", ".github/workflows/"], capture_output=True)
-            result = subprocess.run(["git", "diff", "--staged", "--quiet"])
-            if result.returncode == 0:
-                return True, "Nothing to commit"
-            subprocess.run(["git", "commit", "-m", msg], check=True)
-            return True, f"Committed: {msg}"
-
+    # -- run_tests --
+    def tests_run(h, a):
+        if (h.repo / "tests").exists():
+            r = subprocess.run(
+                ["python3", "-m", "pytest", "tests/", "-x", "-q"],
+                capture_output=True, text=True, timeout=300, cwd=h.repo)
+        elif (h.repo / "package.json").exists():
+            r = subprocess.run(["npm", "test"], capture_output=True,
+                               text=True, timeout=300, cwd=h.repo)
         else:
-            return False, f"Unknown tool: {tool}"
+            return {"note": "no test suite found"}
+        return {"exit": r.returncode,
+                "output": (r.stdout + r.stderr)[:5000]}
 
-    except Exception as e:
-        log(f"Tool execution failed: {tool}: {e}", "ERROR")
-        return False, f"Error: {e}"
+    h.register(ToolContract("run_tests", lambda h, a: {}, tests_run))
+
+    # -- api_github / api_cloudflare (via vault) --
+    def api_pre(h, a):
+        action = a.get("action", "")
+        if not action:
+            raise ContractError("missing action")
+        return {"action": action, "params": a.get("params", {})}
+
+    def gh_run(h, a):
+        return {"result": str(vault_call("github", a["action"],
+                                         a["params"]))[:5000]}
+
+    def cf_run(h, a):
+        return {"result": str(vault_call("cloudflare", a["action"],
+                                         a["params"]))[:5000]}
+
+    h.register(ToolContract("api_github", api_pre, gh_run))
+    h.register(ToolContract("api_cloudflare", api_pre, cf_run))
+
+    # -- comment_issue --
+    def comment_pre(h, a):
+        try:
+            issue = int(a.get("issue", 0))
+        except (TypeError, ValueError):
+            raise ContractError("issue must be an issue number")
+        if isinstance(a.get("issue"), bool) or issue <= 0:
+            raise ContractError("issue must be a positive integer")
+        body = a.get("body", "")
+        if not isinstance(body, str) or not body.strip():
+            raise ContractError("empty body")
+        if len(body) > 10000:
+            raise ContractError("body over 10k chars")
+        return {"issue": issue, "body": body}
+
+    def comment_run(h, a):
+        owner, repo = get_repo()
+        res = vault_call("github", "comment_issue", {
+            "owner": owner, "repo": repo,
+            "issue_number": a["issue"], "body": a["body"]})
+        return {"issue": a["issue"], "result": str(res)[:500]}
+
+    h.register(ToolContract("comment_issue", comment_pre, comment_run))
+
+    # -- create_issue --
+    def create_pre(h, a):
+        title = str(a.get("title", "")).strip()
+        if not title:
+            raise ContractError("empty title")
+        return {"title": title, "body": str(a.get("body", ""))}
+
+    def create_run(h, a):
+        owner, repo = get_repo()
+        res = vault_call("github", "create_issue", {
+            "owner": owner, "repo": repo,
+            "title": a["title"], "body": a["body"]})
+        return {"result": str(res)[:500]}
+
+    h.register(ToolContract("create_issue", create_pre, create_run))
+
+    # -- git_commit (v2 gate: the harness stages the ledger's file set) --
+    def commit_pre(h, a):
+        msg = str(a.get("message", "")).strip()
+        if not msg:
+            raise ContractError("empty commit message")
+        if len(msg) > 500:
+            raise ContractError("commit message > 500 chars")
+        if h.rejected:
+            raise ContractError(
+                f"commit gate: {len(h.rejected)} rejected claim(s) "
+                "unresolved -- verify them with claim_done first")
+        model_files = h.committable_files()
+        try:
+            mem_dirty = bool(h._git("status", "--porcelain", "--",
+                                    "MEMORY.md").strip())
+        except ContractError:
+            mem_dirty = False
+        files = list(model_files)
+        if mem_dirty and "MEMORY.md" not in files:
+            files.append("MEMORY.md")
+        if not files:
+            raise ContractError("commit gate: nothing to commit")
+        for p in mentioned_paths(msg):
+            try:
+                q = norm(h.repo, p)
+            except ContractError:
+                raise ContractError(
+                    f"commit gate: message names {p}, not a repo path")
+            if not (h.repo / q).exists():
+                raise ContractError(
+                    f"commit gate: message names {p}, but it does not exist")
+        return {"message": msg, "files": files}
+
+    def commit_run(h, a):
+        subprocess.run(["git", "config", "user.name", "zero"],
+                       check=True, cwd=h.repo)
+        subprocess.run(["git", "config", "user.email",
+                        "zero@purplepincher.org"], check=True, cwd=h.repo)
+        h._git("add", "--", *a["files"])
+        staged = h._git("diff", "--cached", "--name-only").split()
+        extra = sorted(set(staged) - set(a["files"]))
+        if extra:
+            h._git("reset")
+            raise ContractError(
+                f"commit gate: unexpected staged files {extra}; index reset")
+        h._git("commit", "-m", a["message"])
+        sha = h._git("rev-parse", "HEAD")
+        return {"sha": sha, "files": a["files"]}
+
+    def commit_post(h, a, r):
+        h._git("cat-file", "-e", r["sha"])
+        if h._git("rev-parse", "HEAD") != r["sha"]:
+            raise ContractError("postcondition: HEAD is not the new commit")
+
+    h.register(ToolContract("git_commit", commit_pre, commit_run,
+                            commit_post))
+
+    # -- claim_done: the model's only way to record a completed result --
+    def claim_run(h, a):
+        return h.claim_done(a.get("summary", ""), a.get("evidence", []))
+
+    h.register(ToolContract(
+        "claim_done",
+        lambda h, a: {"summary": a.get("summary", ""),
+                      "evidence": a.get("evidence", [])},
+        claim_run))
+
+    # -- deferred tools: logged, not executed (human reviews) --
+    def _deferred(name):
+        def pre(h, a):
+            return dict(a)
+
+        def run(h, a):
+            return {"deferred": True,
+                    "note": f"{name} is deferred for human review"}
+
+        h.register(ToolContract(name, pre, run))
+
+    for _t in ("write_workflow", "delete_file", "git_push_main"):
+        _deferred(_t)
 
 
 def build_context(task_description=None):
@@ -351,6 +377,18 @@ Tools:
 - comment_issue(issue, body): Comment on a GitHub issue
 - create_issue(title, body): Create a GitHub issue (e.g., to delegate to another agent)
 - git_commit(message): Commit all changes (except workflows)
+- claim_done(summary, evidence): Record a completed result. evidence cites your
+  tool calls, e.g. [{"tool": "write_file", "path": "docs/x.md"}]. The harness
+  verifies each item mechanically against what actually ran.
+
+You act only through tools. Only successful tool calls change the world.
+Every completion claim ("I created X") is mechanically checked against your
+tool-call history for this run. To record a completed result, call claim_done
+with evidence citing your tool calls; unverified claims are rejected and block
+git_commit until resolved. The git_commit tool stages exactly the files your
+successful write_file calls created -- you do not choose the file list.
+Prefer small, verifiable steps. You cannot mark anything done in prose --
+prose is never trusted.
 
 Permissions: write_workflow, delete_file, git_push_main are deferred for human review.
 Be autonomous — don't ask for permission, just do the work and commit.
@@ -371,6 +409,12 @@ def run_agent_loop(task_description=None, max_iterations=None):
     SCRATCH_DIR.mkdir(exist_ok=True)
 
     conversation = []
+
+    # Harness v2: the model is a claimant, the ledger is the truth.
+    harness = Harness(repo=".",
+                      run_id=os.environ.get("GITHUB_RUN_ID", "local"))
+    _register_contracts(harness)
+    harness.new_task()
 
     for i in range(max_iter):
         log(f"--- Iteration {i+1}/{max_iter} ---")
@@ -430,15 +474,29 @@ def run_agent_loop(task_description=None, max_iterations=None):
         if thinking:
             log(f"Thinking: {thinking[:300]}")
 
-        # Check if done
+        # Check if done (claims must verify first -- prose is never trusted)
         if decision.get("done"):
+            if harness.rejected:
+                log(f"Done claimed but {len(harness.rejected)} "
+                    "claim(s) still rejected", "WARN")
+                conversation.append({"role": "assistant", "content": response})
+                conversation.append({
+                    "role": "user",
+                    "content": f"You said done, but these claims are still "
+                    f"unverified: {json.dumps(harness.rejected)}. Call "
+                    f"claim_done with evidence, or do the work."})
+                continue
             summary = decision.get("summary", "Task complete")
             log(f"Agent reports done: {summary}")
             # Update memory
             update_memory(f"Completed: {summary}")
             break
 
-        # Execute tool calls
+        # Advisory: flag claim-shaped prose with no backing tool call
+        for note in harness.scan_prose(thinking):
+            conversation.append({"role": "system", "content": note})
+
+        # Execute tool calls under the harness (ledger records everything)
         tool_calls = decision.get("tool_calls", [])
         if not tool_calls:
             log("No tool calls, asking for clarification")
@@ -448,7 +506,8 @@ def run_agent_loop(task_description=None, max_iterations=None):
 
         results = []
         for tc in tool_calls:
-            success, result = execute_tool(tc)
+            success, result = harness.dispatch(tc.get("tool"),
+                                               tc.get("args", {}))
             status = "OK" if success else "FAIL"
             log(f"  [{status}] {tc.get('tool')}")
             results.append({
@@ -470,6 +529,21 @@ def run_agent_loop(task_description=None, max_iterations=None):
     else:
         log(f"Reached max iterations ({max_iter})", "WARN")
         update_memory(f"Hit max iterations without completing task")
+
+    # Verdict: the ledger, not the model, says what happened. Fail loud.
+    verdict = harness.verdict()
+    log(f"Verdict: complete={verdict['complete']} "
+        f"({len(verdict['accomplished'])} actions, "
+        f"{len(verdict['rejected_claims'])} rejected claims, "
+        f"{len(verdict['failed_calls'])} unrecovered failures)")
+    if verdict["rejected_claims"]:
+        log(f"Rejected claims: {json.dumps(verdict['rejected_claims'])[:500]}",
+            "ERROR")
+    if not verdict["complete"]:
+        update_memory("Incomplete run: unverified claims or unrecovered "
+                      "failures -- see workflow log")
+        log("Run incomplete: failing loud", "ERROR")
+        sys.exit(1)
 
     log("Agent loop complete")
 
