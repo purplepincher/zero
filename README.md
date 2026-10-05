@@ -66,7 +66,7 @@ See `docs/clones.md` for the shell model.
 
 ```
 .github/workflows/   think.yml, react.yml, message.yml
-.github/scripts/      agent.py (the brain), act.py (the hands)
+.github/scripts/      agent.py (the brain — thinks and acts)
 docs/                 plugins.md, i2i.md, memory.md, clones.md, tripartite.md,
                       messengers.md
 AGENTS.md             operator's manual
